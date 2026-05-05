@@ -1,0 +1,96 @@
+package com.netopt.model
+
+import android.os.Parcelable
+import kotlinx.parcelize.Parcelize
+
+// ── DNS 提供商 ──────────────────────────────────────────────────────
+sealed class DnsProvider {
+    object OFF : DnsProvider()
+    object AUTO : DnsProvider()
+    data class Custom(val hostname: String) : DnsProvider()
+
+    companion object {
+        val PRESETS = listOf(
+            Custom("1.1.1.1"),                     // Cloudflare
+            Custom("dns.google"),                   // Google DoH
+            Custom("dns.alidns.com"),               // 阿里云
+            Custom("doh.pub"),                      // DNSPod
+            Custom("doh.360.cn"),                   // 360
+        )
+    }
+}
+
+// ── TCP 拥塞算法 ─────────────────────────────────────────────────────
+enum class TcpAlgorithm(val displayName: String, val kernelName: String) {
+    CUBIC("CUBIC（默认）", "cubic"),
+    BBR("BBR（推荐）", "bbr"),
+    HTCP("H-TCP", "htcp"),
+    WESTWOOD("Westwood+", "westwood"),
+    VEGAS("TCP Vegas", "vegas"),
+}
+
+// ── 完整网络配置（持久化） ────────────────────────────────────────────
+@Parcelize
+data class NetworkConfig(
+    // DNS
+    val dnsEnabled: Boolean = true,
+    val dnsProvider: String = "1.1.1.1",
+
+    // TCP
+    val tcpTuningEnabled: Boolean = true,
+    val tcpAlgorithm: TcpAlgorithm = TcpAlgorithm.BBR,
+    val sendBufKB: Int = 4096,      // 4 MB
+    val recvBufKB: Int = 8192,      // 8 MB
+    val enableIpv6Optimization: Boolean = true,
+
+    // QoS
+    val qosEnabled: Boolean = false,
+    val downloadLimitMbps: Int = 0,   // 0 = unlimited
+    val uploadLimitMbps: Int = 0,
+
+    // App policy
+    val networkIsolationEnabled: Boolean = false,
+    val restrictedUids: Set<Int> = emptySet(),
+) : Parcelable
+
+// ── 实时网络状态快照 ─────────────────────────────────────────────────
+data class NetworkSnapshot(
+    val timestampMs: Long = System.currentTimeMillis(),
+    val iface: String = "wlan0",
+    val rxBytesPerSec: Long = 0,
+    val txBytesPerSec: Long = 0,
+    val latencyMs: Float = 0f,
+    val signalDbm: Int = 0,
+    val ssid: String = "",
+    val ipAddress: String = "",
+    val currentDns: String = "",
+    val congestionAlgorithm: String = "",
+) {
+    val downloadMbps: Float get() = rxBytesPerSec * 8f / 1_000_000f
+    val uploadMbps: Float get() = txBytesPerSec * 8f / 1_000_000f
+    val signalQuality: SignalQuality get() = when {
+        signalDbm >= -50 -> SignalQuality.EXCELLENT
+        signalDbm >= -65 -> SignalQuality.GOOD
+        signalDbm >= -75 -> SignalQuality.FAIR
+        else -> SignalQuality.POOR
+    }
+}
+
+enum class SignalQuality(val label: String, val colorRes: Int) {
+    EXCELLENT("优秀", 0xFF4ADE80.toInt()),
+    GOOD("良好", 0xFF86EFAC.toInt()),
+    FAIR("一般", 0xFFFBBF24.toInt()),
+    POOR("较差", 0xFFEF4444.toInt()),
+}
+
+// ── 应用网络信息 ─────────────────────────────────────────────────────
+data class AppNetInfo(
+    val uid: Int,
+    val packageName: String,
+    val appName: String,
+    val icon: android.graphics.drawable.Drawable? = null,
+    val rxBytes: Long = 0,
+    val txBytes: Long = 0,
+    val isBackgroundRestricted: Boolean = false,
+    val isSystemApp: Boolean = false,
+)

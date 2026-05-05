@@ -1,0 +1,161 @@
+package com.netopt.ui.home
+
+import android.app.Application
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.net.wifi.WifiManager
+import android.text.format.Formatter
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.netopt.model.*
+import com.netopt.service.NetworkOptimizer
+import com.netopt.shizuku.ShizukuBridge
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+
+class HomeViewModel(app: Application) : AndroidViewModel(app) {
+
+    // ── Shizuku 状态 ─────────────────────────────────────────────────
+    val shizukuState: StateFlow<ShizukuBridge.State> = ShizukuBridge.state
+
+    // ── 用户配置 ─────────────────────────────────────────────────────
+    private val _config = MutableStateFlow(NetworkConfig())
+    val config: StateFlow<NetworkConfig> = _config
+
+    // ── 实时网络快照（每秒刷新） ─────────────────────────────────────
+    private val _snapshot = MutableStateFlow(NetworkSnapshot())
+    val snapshot: StateFlow<NetworkSnapshot> = _snapshot
+
+    // ── 操作结果提示 ─────────────────────────────────────────────────
+    private val _toastMsg = MutableSharedFlow<String>()
+    val toastMsg: SharedFlow<String> = _toastMsg
+
+    // ── 后台轮询 ─────────────────────────────────────────────────────
+    private var pollJob: Job? = null
+    private var prevRx = 0L
+    private var prevTx = 0L
+
+    init {
+        ShizukuBridge.register()
+        startPolling()
+    }
+
+    private fun startPolling() {
+        pollJob = viewModelScope.launch {
+            while (isActive) {
+                updateSnapshot()
+                delay(1000)
+            }
+        }
+    }
+
+    private suspend fun updateSnapshot() {
+        val ctx = getApplication<Application>()
+        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val wm = ctx.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val wifiInfo = wm.connectionInfo
+
+        val stats = NetworkOptimizer.readNetStats("wlan0")
+        val rx = stats["rx_bytes"] ?: 0L
+        val tx = stats["tx_bytes"] ?: 0L
+
+        val algo = ShizukuBridge.readFile(
+            "/proc/sys/net/ipv4/tcp_congestion_control"
+        ) ?: "unknown"
+
+        _snapshot.value = NetworkSnapshot(
+            iface = "wlan0",
+            rxBytesPerSec = (rx - prevRx).coerceAtLeast(0),
+            txBytesPerSec = (tx - prevTx).coerceAtLeast(0),
+            signalDbm = wifiInfo.rssi,
+            ssid = wifiInfo.ssid?.removeSurrounding("\"") ?: "",
+            ipAddress = Formatter.formatIpAddress(wifiInfo.ipAddress),
+            congestionAlgorithm = algo,
+        )
+        prevRx = rx
+        prevTx = tx
+    }
+
+    // ── 用户操作 ─────────────────────────────────────────────────────
+
+    fun requestShizuku() {
+        ShizukuBridge.requestPermissionIfNeeded(getApplication())
+    }
+
+    fun toggleDns(enabled: Boolean) {
+        val provider = if (enabled) {
+            DnsProvider.Custom(_config.value.dnsProvider)
+        } else DnsProvider.OFF
+
+        viewModelScope.launch {
+            val result = NetworkOptimizer.setPrivateDns(provider)
+            result.onSuccess {
+                _config.value = _config.value.copy(dnsEnabled = enabled)
+                _toastMsg.emit(if (enabled) "DNS 加速已启用" else "DNS 已恢复默认")
+            }.onFailure {
+                _toastMsg.emit("DNS 设置失败: ${it.message}")
+            }
+        }
+    }
+
+    fun setDnsProvider(hostname: String) {
+        _config.value = _config.value.copy(dnsProvider = hostname)
+        if (_config.value.dnsEnabled) toggleDns(true)
+    }
+
+    fun toggleTcpTuning(enabled: Boolean) {
+        viewModelScope.launch {
+            if (enabled) {
+                val result = NetworkOptimizer.applyTcpTuning(_config.value)
+                result.onSuccess {
+                    _config.value = _config.value.copy(tcpTuningEnabled = true)
+                    _toastMsg.emit("TCP 优化已应用（BBR + 大缓冲）")
+                }.onFailure {
+                    _toastMsg.emit("TCP 优化部分失败（某些参数需要 root）")
+                }
+            } else {
+                // 恢复默认配置
+                val default = NetworkConfig(tcpTuningEnabled = false, tcpAlgorithm = TcpAlgorithm.CUBIC)
+                NetworkOptimizer.applyTcpTuning(default)
+                _config.value = _config.value.copy(tcpTuningEnabled = false)
+                _toastMsg.emit("TCP 已恢复默认")
+            }
+        }
+    }
+
+    fun setTcpAlgorithm(algo: TcpAlgorithm) {
+        _config.value = _config.value.copy(tcpAlgorithm = algo)
+        if (_config.value.tcpTuningEnabled) toggleTcpTuning(true)
+    }
+
+    fun flushDns() {
+        viewModelScope.launch {
+            NetworkOptimizer.flushDnsCache()
+                .onSuccess { _toastMsg.emit("DNS 缓存已清除") }
+                .onFailure { _toastMsg.emit("刷新失败: ${it.message}") }
+        }
+    }
+
+    fun toggleNetworkIsolation(enabled: Boolean) {
+        _config.value = _config.value.copy(networkIsolationEnabled = enabled)
+    }
+
+    fun setAppRestricted(uid: Int, restricted: Boolean) {
+        viewModelScope.launch {
+            NetworkOptimizer.setAppBackgroundRestricted(uid, restricted)
+                .onSuccess {
+                    val uids = _config.value.restrictedUids.toMutableSet()
+                    if (restricted) uids.add(uid) else uids.remove(uid)
+                    _config.value = _config.value.copy(restrictedUids = uids)
+                }
+                .onFailure { _toastMsg.emit("设置失败: ${it.message}") }
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        pollJob?.cancel()
+        ShizukuBridge.unregister()
+    }
+}
